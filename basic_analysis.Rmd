@@ -1,0 +1,396 @@
+---
+title: OMICS Margo
+author: Laura Perlaza-Jimenez
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# r_libpath = "/researchers/paul.neeson/RStudio/shared_libs/renv/scRNAseq_r4.1.2_s/renv/library/R-4.0/x86_64-pc-linux-gnu/"
+# if (length(grep(pattern=r_libpath, .libPaths()))==0) {
+#   .libPaths(c(r_libpath, .libPaths()))
+# }
+# 
+# renv::activate(project="/researchers/paul.neeson/RStudio/shared_libs/renv/scRNAseq_r4.1.2_s")
+
+```
+
+
+
+```{r, echo=FALSE, include=FALSE}
+rm(list=ls());
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(ggplot2)
+library(sctransform)
+library(tibble)
+library(DT)
+library(RColorBrewer)
+library(ggthemes)
+library(ggpubr)
+library(patchwork)
+library(future)
+library(SingleCellExperiment)
+library(scuttle)
+library(statmod)
+#library(DropletUtils)
+library(future)
+library(GenomeInfoDb)
+library(hdf5r)
+library(clustree)
+library(SeuratDisk)
+library(scater)
+set.seed(1)
+
+```
+
+```
+Code based on tutorial at:
+https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis.html
+
+```
+
+```
+Prepare indexes before hand
+gunzip -d atac_fragments.tsv.gz
+bgzip atac_fragments.tsv
+tabix -p bed atac_fragments.tsv.gz
+
+```
+
+## Load 10X data
+
+```{r, echo=FALSE}
+## Path configurations
+base.10X.data.path = "~/data/tasks/margo.montandon/countmatrix/"
+grcz11.annotation.path = "~/data/tasks/margo.montandon/reference/Danio_rerio.GRCz11.105.filtered.gtf.granges.rds"
+
+## load annotation object for sample loading use
+annotations = readRDS(grcz11.annotation.path)
+seqlevelsStyle(annotations) <- 'ensembl'
+genome(annotations) <- "GRCz11"
+
+```
+
+```{r eval=FALSE}
+#creating the ranges for python SCENIC+ part
+gr <- GRanges(seqnames = seqnames(annotations),
+              ranges = ranges(annotations))
+
+# split gr by seqnames
+grl <- split(gr, seqnames(gr))
+
+# Get the width of each range organized as an IntegerList
+wgr <- width(grl)
+# if gr is ordered by seqnames this is equivalent to:
+wgr <- splitAsList(width(gr), seqnames(gr))
+# longest ranges
+longestRanges <- unlist(grl[which(wgr == max(wgr))])
+
+View(data.frame(longestRanges))
+longestRanges<-longestRanges[!duplicated(longestRanges)]
+start(longestRanges)=1
+View(data.frame(longestRanges))
+
+library(BiocPyRanges) #load this independenyl otherwise in conflict with Seurat
+#remotes::install_github("hpages/BiocPyRanges")
+
+pyAnnotation<-makePyRangesFromGRanges(longestRanges)
+use_virtualenv("r-reticulate")
+py_install("pyranges")
+#py_save_object(pyAnnotation,"data/tasks/margo.montandon/Analysis/GenomeRef_pyAnnotation.obj")
+```
+
+read files
+
+```{r, echo=FALSE}
+samples = c("2dpf","4dpf","6dpf")
+
+
+for (sample in samples) {
+      data.path = paste0(base.10X.data.path,"/",sample,"/filtered_feature_bc_matrix.h5")
+      frag.file = paste0(base.10X.data.path,"/",sample,"/atac_fragments.tsv.gz")
+    
+      # extract RNA and ATAC data
+      inputdata.10x <- Read10X_h5(data.path)
+      rna_counts <- inputdata.10x$`Gene Expression`
+      atac_counts <- inputdata.10x$Peaks
+    
+      # Create Seurat object
+      sobj <- CreateSeuratObject(counts = rna_counts,project = sample)
+     # sobj[["percent.mt"]] <- PercentageFeatureSet(sobj, pattern = "^mt-")
+    
+      # Now add in the ATAC-seq data
+      # we'll only use peaks in standard chromosomes -- note this will remove scaffold chromosomes eg. KN1....
+      #
+      grange.counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+      grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+      atac_counts <- atac_counts[as.vector(grange.use), ]
+    
+    
+      chrom_assay <- CreateChromatinAssay(
+         counts = atac_counts,
+         sep = c(":", "-"),
+         genome = NULL,
+         fragments = frag.file,
+         min.cells = 10,
+         annotation = annotations
+       )
+
+
+      sobj[["ATAC"]] <- chrom_assay
+      sobj$condition<- sample
+      name=paste0("sample.",sample)
+      assign(name, sobj)
+  
+  }
+
+
+
+```
+
+
+# sample.2dpf
+
+
+```{r}
+sobj.sample<-sample.2dpf
+
+sobj.sample <- subset(
+            x = sobj.sample,
+            subset = nCount_ATAC > 100 &
+              nCount_RNA > 100 
+            #&
+              #percent.mt < 20
+)
+
+DefaultAssay(sobj.sample) <- "RNA"
+sobj.sample <- SCTransform(sobj.sample, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+# ATAC analysis
+# We exclude the first dimension as this is typically correlated with sequencing depth
+DefaultAssay(sobj.sample) <- "ATAC"
+sobj.sample <- RunTFIDF(sobj.sample)
+sobj.sample <- FindTopFeatures(sobj.sample, min.cutoff = 'q0')
+#sobj.sample <- RunSVD(sobj.sample) #this is broken in last seurat version
+#sobj.sample <- RunUMAP(sobj.sample, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+#sobj.sample <- RunUMAP(sobj.sample, dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+
+
+#DefaultAssay(sobj.sample) <- "RNA"
+#sobj.sample <- FindMultiModalNeighbors(sobj.sample,  dims.list = list(1:50, 2:50))
+#sobj.sample <- FindMultiModalNeighbors(sobj.sample, reduction.list = list("pca", "lsi"), dims.list = list(1:50, 2:50))
+
+#sobj.sample <- RunUMAP(sobj.sample, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+#sobj.sample <- FindClusters(sobj.sample, graph.name = "wsnn", algorithm = 3, verbose = FALSE,resolution = seq(0.1,2,by=0.1))
+
+#clustree(sobj.sample,prefix="wsnn_res.")
+
+```
+
+
+```{r}
+sobj.sample<-sample.4dpf
+
+sobj.sample <- subset(
+            x = sobj.sample,
+            subset = nCount_ATAC > 100 &
+              nCount_RNA > 100 
+            #&
+             # percent.mt < 20
+)
+
+DefaultAssay(sobj.sample) <- "RNA"
+sobj.sample <- SCTransform(sobj.sample, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+# ATAC analysis
+# We exclude the first dimension as this is typically correlated with sequencing depth
+DefaultAssay(sobj.sample) <- "ATAC"
+sobj.sample <- RunTFIDF(sobj.sample)
+sobj.sample <- FindTopFeatures(sobj.sample, min.cutoff = 'q0')
+#sobj.sample <- RunSVD(sobj.sample)
+#sobj.sample <- RunUMAP(sobj.sample, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+#DefaultAssay(sobj.sample) <- "RNA"
+#sobj.sample <- FindMultiModalNeighbors(sobj.sample, reduction.list = list("pca", "lsi"), dims.list = list(1:50, 2:50))
+#sobj.sample <- RunUMAP(sobj.sample, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+#sobj.sample <- FindClusters(sobj.sample, graph.name = "wsnn", algorithm = 3, verbose = FALSE,resolution = seq(0.1,2,by=0.1))
+
+#clustree(sobj.sample,prefix="wsnn_res.")
+
+```
+
+```{r}
+sobj.sample<-sample.6dpf
+
+sobj.sample <- subset(
+            x = sobj.sample,
+            subset = nCount_ATAC > 100 &
+              nCount_RNA > 100 
+            #&
+             # percent.mt < 20
+)
+
+DefaultAssay(sobj.sample) <- "RNA"
+sobj.sample <- SCTransform(sobj.sample, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+# ATAC analysis
+# We exclude the first dimension as this is typically correlated with sequencing depth
+DefaultAssay(sobj.sample) <- "ATAC"
+sobj.sample <- RunTFIDF(sobj.sample)
+sobj.sample <- FindTopFeatures(sobj.sample, min.cutoff = 'q0')
+#sobj.sample <- RunSVD(sobj.sample)
+#sobj.sample <- RunUMAP(sobj.sample, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+#DefaultAssay(sobj.sample) <- "RNA"
+#sobj.sample <- FindMultiModalNeighbors(sobj.sample, reduction.list = list("pca", "lsi"), dims.list = list(1:50, 2:50))
+#sobj.sample <- RunUMAP(sobj.sample, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+#sobj.sample <- FindClusters(sobj.sample, graph.name = "wsnn", algorithm = 3, verbose = FALSE,resolution = seq(0.1,2,by=0.1))
+
+#clustree(sobj.sample,prefix="wsnn_res.")
+
+```
+
+
+
+### Basic QC:
+
+```{r}
+
+sobj.merged =  merge(sample.2dpf, y = c(sample.4dpf, sample.6dpf), add.cell.ids = c("2df", "4df", "6df"), project = "MM")
+
+table(sobj.merged$orig.ident)
+
+
+```
+
+```{r}
+VlnPlot(sobj.merged, features = "nFeature_RNA",  log = TRUE, pt.size = 0.1) + NoLegend()
+VlnPlot(sobj.merged, features = "nCount_RNA",  log = TRUE, pt.size = 0.1) + NoLegend()
+VlnPlot(sobj.merged, features = "percent.mt", log = TRUE, pt.size = 0.1) + NoLegend()
+FeatureScatter(sobj.merged, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by ="condition")
+FeatureScatter(sobj.merged, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by ="condition")
+
+
+
+```
+
+### Filtering nCount_ATAC more 100 and nCount_RNA mora than 100 and mi percentage less than 20
+
+
+```{r, echo=FALSE}
+
+sobj.merged <- subset(
+            x = sobj.merged,
+            subset = nCount_ATAC > 100 &
+              nCount_RNA > 100 &
+              percent.mt < 20
+)
+
+VlnPlot(sobj.merged, features = "nFeature_RNA",  log = TRUE, pt.size = 0.1) + NoLegend()
+VlnPlot(sobj.merged, features = "nCount_RNA",  log = TRUE, pt.size = 0.1) + NoLegend()
+VlnPlot(sobj.merged, features = "percent.mt", log = TRUE, pt.size = 0.1) + NoLegend()
+FeatureScatter(sobj.merged, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by ="condition")
+FeatureScatter(sobj.merged, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by ="condition")
+
+
+table(sobj.merged$orig.ident)
+```
+
+### Normalization using SCT transform
+
+
+```{r, echo=FALSE}
+
+DefaultAssay(sobj.merged) <- "RNA"
+sobj.merged <- SCTransform(sobj.merged, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+sobj.merged_cellPC<- sobj.merged %>% FindVariableFeatures() %>% ScaleData() 
+sobj.merged_cellPC<-  RunPCA(sobj.merged_cellPC,rev.pca = FALSE)
+#write.table(sobj.merged_cellPC@reductions$pca@cell.embeddings,"data/tasks/margo.montandon/Analysis/Seurat_obj_PCs.txt",sep="\t")
+```
+
+
+```{r}
+
+# ATAC analysis
+# We exclude the first dimension as this is typically correlated with sequencing depth
+DefaultAssay(sobj.merged) <- "ATAC"
+sobj.merged <- RunTFIDF(sobj.merged)
+sobj.merged <- FindTopFeatures(sobj.merged, min.cutoff = 'q0')
+sobj.merged <- RunSVD(sobj.merged)
+sobj.merged <- RunUMAP(sobj.merged, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+ #saveRDS(sobj.merged, file="/researchers/niko.thio/Analysis/margo/multiome/221221_A01524_0085_AHJJLTDSX3/R/sobj.merged_post.RNA.ATAC.preprocessing.rds")
+
+```
+
+```{r, echo=FALSE}
+
+DefaultAssay(sobj.merged) <- "RNA"
+sobj.merged <- FindMultiModalNeighbors(sobj.merged, reduction.list = list("pca", "lsi"), dims.list = list(1:50, 2:50))
+sobj.merged <- RunUMAP(sobj.merged, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+sobj.merged <- FindClusters(sobj.merged, graph.name = "wsnn", algorithm = 3, verbose = FALSE,resolution = seq(0.1,2,by=0.1))
+
+```
+
+clustree
+
+```{r}
+clustree(sobj.merged,prefix="wsnn_res.")
+
+```
+
+### UMAP {.tabset}
+
+#### Clustering (WNN)
+
+```{r, echo=FALSE, fig.width=15, fig.height=5}
+
+p1 <- DimPlot(sobj.merged, reduction = "umap.rna", group.by = "seurat_clusters", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("RNA")
+p2 <- DimPlot(sobj.merged, reduction = "umap.atac", group.by = "seurat_clusters", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("ATAC")
+p3 <- DimPlot(sobj.merged, reduction = "wnn.umap", group.by = "seurat_clusters", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("WNN")
+p1 + p2 + p3 & NoLegend() & theme(plot.title = element_text(hjust = 0.5))
+
+#SaveH5Seurat(sobj.merged,"~/data/tasks/margo.montandon/Analysis/sobj.merged")
+
+#Convert("~/data/tasks/margo.montandon/Analysis/sobj.merged.h5seurat", dest = "h5ad")
+
+```
+
+#### Sample 
+
+```{r, echo=FALSE, fig.width=15, fig.height=5}
+
+sobj.merged2 = sobj.merged %>% AddMetaData(metadata=(rownames(sobj.merged[[]]) %>% gsub(pattern="_.*", replacement="")), col.name="sample")
+
+
+p1 <- DimPlot(sobj.merged2, reduction = "umap.rna", group.by = "sample", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("RNA")
+p2 <- DimPlot(sobj.merged2, reduction = "umap.atac", group.by = "sample", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("ATAC")
+p3 <- DimPlot(sobj.merged2, reduction = "wnn.umap", group.by = "sample", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("WNN")
+p1 + p2 + p3 & theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+### Cluster markers
+
+```{r, echo=FALSE}
+cluster.markers = FindAllMarkers(sobj.merged2, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+```
+
+```{r, echo=FALSE, fig.width=10, fig.height=30}
+cluster.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 50, order_by = avg_log2FC) %>%
+    dplyr::select("gene", "cluster", "avg_log2FC", "pct.1", "pct.2", "p_val_adj") %>%
+    datatable(filter="top", class="compact", rownames = FALSE)  
+```
